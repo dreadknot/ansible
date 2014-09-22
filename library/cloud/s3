@@ -119,8 +119,6 @@ EXAMPLES = '''
 - s3: bucket=mybucket object=/my/directory/path mode=create
 # Delete a bucket and all contents
 - s3: bucket=mybucket mode=delete
-# GET newest file in bucket
-- s3: bucket=mybucket object=/my/desired/ dest=/usr/local/myfile.txt mode=getnew
 '''
 
 import sys
@@ -229,6 +227,18 @@ def upload_s3file(module, s3, bucket, obj, src, expiry, metadata):
     except s3.provider.storage_copy_error, e:
         module.fail_json(msg= str(e))
 
+def download_newest_file(module, s3, bucket, obj, dest):
+    try:
+        bucket = s3.lookup(bucket)
+        l = [(k.last_modified,k) for k in bucket]
+        key_to_download = sorted(l, cmp=lambda x,y: cmp(x[0], y[0]))[-1][1]
+        key = bucket.lookup(key_to_download)
+        key.get_contents_to_filename(dest)
+        module.exit_json(msg="GET operation complete", changed=True)
+    except s3.provider.storage_copy_error, e:
+        module.fail_json(msg= str(e))   
+
+
 def download_s3file(module, s3, bucket, obj, dest):
     try:
         bucket = s3.lookup(bucket)
@@ -280,7 +290,7 @@ def main():
             object         = dict(),
             src            = dict(),
             dest           = dict(default=None),
-            mode           = dict(choices=['get', 'put', 'delete', 'create', 'geturl', 'getstr'], required=True),
+            mode           = dict(choices=['get', 'put', 'delete', 'create', 'geturl', 'getstr', 'getnew'], required=True),
             expiry         = dict(default=600, aliases=['expiration']),
             s3_url         = dict(aliases=['S3_URL']),
             overwrite      = dict(aliases=['force'], default=True, type='bool'),
@@ -335,6 +345,49 @@ def main():
             s3 = boto.connect_s3(aws_access_key, aws_secret_key)
         except boto.exception.NoAuthHandlerFound, e:
             module.fail_json(msg = str(e))
+
+   # If our mode is a GET operation (download), go through the procedure as appropriate ...
+    if mode == 'getnew':
+    
+        # First, we check to see if the bucket exists, we get "bucket" returned.
+        bucketrtn = bucket_check(module, s3, bucket)
+        if bucketrtn is False:
+            module.fail_json(msg="Target bucket cannot be found", failed=True)
+
+        # Next, we check to see if the key in the bucket exists. If it exists, it also returns key_matches md5sum check.
+        #keyrtn = key_check(module, s3, bucket, obj)    
+        #if keyrtn is False:
+        #    module.fail_json(msg="Target key cannot be found", failed=True)
+
+        # If the destination path doesn't exist, no need to md5um etag check, so just download.
+        pathrtn = path_check(dest)
+        if pathrtn is False:
+            download_newest_file(module, s3, bucket, obj, dest)
+
+        # Compare the remote MD5 sum of the object with the local dest md5sum, if it already exists. 
+        if pathrtn is True:
+            md5_remote = keysum(module, s3, bucket, obj)
+            md5_local = hashlib.md5(open(dest, 'rb').read()).hexdigest()
+            if md5_local == md5_remote:
+                sum_matches = True
+                if overwrite is True:
+                    download_newest_file(module, s3, bucket, obj, dest)
+                else:
+                    module.exit_json(msg="Local and remote object are identical, ignoring. Use overwrite parameter to force.", changed=False)
+            else:
+                sum_matches = False
+                if overwrite is True:
+                    download_newest_file(module, s3, bucket, obj, dest)
+                else:
+                    module.fail_json(msg="WARNING: Checksums do not match. Use overwrite parameter to force download.", failed=True)
+        
+        # Firstly, if key_matches is TRUE and overwrite is not enabled, we EXIT with a helpful message. 
+        if sum_matches is True and overwrite is False:
+            module.exit_json(msg="Local and remote object are identical, ignoring. Use overwrite parameter to force.", changed=False)
+
+        # At this point explicitly define the overwrite condition.
+        if sum_matches is True and pathrtn is True and overwrite is True:
+            download_newest_file(module, s3, bucket, obj, dest)
  
     # If our mode is a GET operation (download), go through the procedure as appropriate ...
     if mode == 'get':
